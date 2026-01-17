@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI Receptionist - Voice</title>
+  <style>
+    * { margin:0; padding:0; box-sizing:border-box; }
+    body{
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background: linear-gradient(135deg,#1a1a2e 0%,#16213e 100%);
+      min-height:100vh; display:flex; justify-content:center; align-items:center; color:#fff;
+    }
+    .container{
+      text-align:center; padding:40px; background:rgba(255,255,255,0.05);
+      border-radius:20px; backdrop-filter:blur(10px);
+      border:1px solid rgba(255,255,255,0.1);
+      max-width:500px; width:90%;
+    }
+    h1{ font-size:1.8rem; margin-bottom:10px; color:#e94560; }
+    .subtitle{ color:#8892b0; margin-bottom:30px; }
+    #status{
+      padding:10px 20px; background:rgba(0,0,0,0.3);
+      border-radius:20px; margin-bottom:30px; font-size:0.9rem;
+      white-space:pre-wrap;
+    }
+    .status-connected{ color:#4ade80; }
+    .status-disconnected{ color:#f87171; }
+    .status-speaking{ color:#60a5fa; }
+    .status-listening{ color:#fbbf24; }
+
+    #mic-btn{
+      width:120px; height:120px; border-radius:50%; border:none;
+      background: linear-gradient(135deg,#e94560 0%,#c23a51 100%);
+      color:white; font-size:3rem; cursor:pointer; transition:all 0.3s ease;
+      box-shadow:0 4px 25px rgba(233,69,96,0.4); margin-bottom:20px;
+    }
+    #mic-btn:hover{ transform:scale(1.05); box-shadow:0 6px 35px rgba(233,69,96,0.6); }
+    #mic-btn.active{
+      background: linear-gradient(135deg,#4ade80 0%,#22c55e 100%);
+      box-shadow:0 4px 25px rgba(74,222,128,0.4);
+      animation:pulse 1.5s infinite;
+    }
+    @keyframes pulse{ 0%,100%{ transform:scale(1);} 50%{ transform:scale(1.08);} }
+    #mic-btn:disabled{ background:#444; cursor:not-allowed; box-shadow:none; }
+
+    .transcript-box{
+      background:rgba(0,0,0,0.3); border-radius:12px; padding:20px; margin-top:20px;
+      text-align:left; max-height:200px; overflow-y:auto;
+    }
+    .transcript-label{ font-size:0.75rem; color:#8892b0; margin-bottom:5px; }
+    .transcript-text{ font-size:1rem; line-height:1.5; white-space:pre-wrap; }
+    .user-text{ color:#60a5fa; }
+    .ai-text{ color:#4ade80; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>🎙️ AI Receptionist</h1>
+    <p class="subtitle">Real-time Voice Assistant</p>
+
+    <div id="status" class="status-disconnected">Disconnected</div>
+
+    <button id="mic-btn" disabled>🎤</button>
+    <p style="color:#8892b0; font-size:0.85rem;">Click to start talking</p>
+
+    <div class="transcript-box">
+      <div class="transcript-label">Conversation:</div>
+      <div id="transcript" class="transcript-text"></div>
+    </div>
+  </div>
+
+  <script>
+    const statusEl = document.getElementById('status');
+    const micBtn = document.getElementById('mic-btn');
+    const transcriptEl = document.getElementById('transcript');
+
+    let ws = null;
+
+    // Use ONE AudioContext for both record + playback (Edge is happiest this way)
+    let audioCtx = null;
+    let playerNode = null;
+    let recorderNode = null;
+    let micStream = null;
+
+    let isRecording = false;
+    let isAISpeaking = false;
+    let lastAudioAt = 0;
+    let speechEndTimer = null;
+
+    const TARGET_RATE = 24000; // OpenAI PCM16 is 24k
+
+    function setStatus(text, className) {
+      statusEl.textContent = text;
+      statusEl.className = className;
+    }
+
+    function addTranscript(text, type) {
+      const span = document.createElement('span');
+      span.className = type === 'user' ? 'user-text' : 'ai-text';
+      span.textContent = (type === 'user' ? '👤 ' : '🤖 ') + text + '\n';
+      transcriptEl.appendChild(span);
+      transcriptEl.scrollTop = transcriptEl.scrollHeight;
+    }
+
+    let currentAIText = '';
+    function updateAITranscript(delta) {
+      currentAIText += delta;
+      const lastSpan = transcriptEl.lastElementChild;
+      if (lastSpan && lastSpan.classList.contains('ai-text') && !lastSpan.dataset.complete) {
+        lastSpan.textContent = '🤖 ' + currentAIText;
+      } else {
+        const span = document.createElement('span');
+        span.className = 'ai-text';
+        span.textContent = '🤖 ' + currentAIText;
+        transcriptEl.appendChild(span);
+      }
+      transcriptEl.scrollTop = transcriptEl.scrollHeight;
+    }
+
+    function completeAITranscript() {
+      const lastSpan = transcriptEl.lastElementChild;
+      if (lastSpan && lastSpan.classList.contains('ai-text')) {
+        lastSpan.dataset.complete = 'true';
+        lastSpan.textContent += '\n';
+      }
+      currentAIText = '';
+    }
+
+    // ---------- WebSocket ----------
+    function connect() {
+      const proto = (window.location.protocol === 'https:') ? 'wss' : 'ws';
+      ws = new WebSocket(`${proto}://${window.location.host}/ws-voice`);
+      ws.binaryType = 'arraybuffer';
+
+      ws.onopen = () => {
+        setStatus('Connected - Click mic to talk', 'status-connected');
+        micBtn.disabled = false;
+      };
+
+      ws.onclose = () => {
+        setStatus('Disconnected - Reconnecting...', 'status-disconnected');
+        micBtn.disabled = true;
+        stopEverything();
+        setTimeout(connect, 2000);
+      };
+
+      ws.onerror = (err) => {
+        console.error('WebSocket error:', err);
+        setStatus('Connection error', 'status-disconnected');
+      };
+
+      ws.onmessage = async (event) => {
+        // Binary audio from server (PCM16 @ 24k)
+        if (event.data instanceof ArrayBuffer) {
+          await ensureAudio();
+          if (audioCtx.state === 'suspended') await audioCtx.resume();
+
+          lastAudioAt = performance.now();
+          if (!isAISpeaking) {
+            isAISpeaking = true;
+            setStatus(`AI Speaking...\n(AudioCtx: ${audioCtx.sampleRate} Hz, stream: 24k)`, 'status-speaking');
+          }
+
+          // Feed player worklet (it upsamples to audioCtx.sampleRate internally)
+          playerNode.port.postMessage(event.data, [event.data]);
+          scheduleSpeechEnd();
+          return;
+        }
+
+        // JSON messages
+        const data = JSON.parse(event.data);
+        if (data.type === 'transcript') updateAITranscript(data.text);
+        else if (data.type === 'user_transcript') addTranscript(data.text, 'user');
+        else if (data.type === 'response_end') completeAITranscript();
+        else if (data.type === 'error') {
+          console.error('Server error:', data.message);
+          setStatus('Error: ' + data.message, 'status-disconnected');
+        }
+      };
+    }
+
+    function scheduleSpeechEnd() {
+      if (speechEndTimer) clearTimeout(speechEndTimer);
+      speechEndTimer = setTimeout(() => {
+        if (performance.now() - lastAudioAt > 350) {
+          isAISpeaking = false;
+          if (isRecording) setStatus(`Listening...\n(AudioCtx: ${audioCtx.sampleRate} Hz)`, 'status-listening');
+          else setStatus(`Connected - Click mic to talk\n(AudioCtx: ${audioCtx.sampleRate} Hz)`, 'status-connected');
+        }
+      }, 500);
+    }
+
+    // ---------- Audio (one context, two worklets) ----------
+    async function ensureAudio() {
+      if (audioCtx && audioCtx.state !== 'closed' && playerNode && recorderNode) return;
+
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)({
+        latencyHint: 'interactive'
+      });
+
+      await audioCtx.audioWorklet.addModule(createCombinedWorkletURL());
+
+      // Player: smooth ring buffer + jitter buffer + resample 24k -> ctxRate
+      playerNode = new AudioWorkletNode(audioCtx, 'pcm-player', {
+        numberOfInputs: 0,
+        numberOfOutputs: 1,
+        outputChannelCount: [1]
+      });
+      playerNode.connect(audioCtx.destination);
+
+      // Recorder: resample ctxRate -> 24k and send PCM16 frames to main thread
+      recorderNode = new AudioWorkletNode(audioCtx, 'pcm-recorder', {
+        numberOfInputs: 1,
+        numberOfOutputs: 0
+      });
+
+      recorderNode.port.onmessage = (e) => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(e.data); // ArrayBuffer: PCM16 @ 24k
+        }
+      };
+
+      setStatus(`Connected - Click mic to talk\n(AudioCtx: ${audioCtx.sampleRate} Hz)`, 'status-connected');
+    }
+
+    function stopEverything() {
+      isRecording = false;
+      isAISpeaking = false;
+      if (speechEndTimer) clearTimeout(speechEndTimer);
+      speechEndTimer = null;
+
+      try { if (playerNode) playerNode.disconnect(); } catch {}
+      playerNode = null;
+
+      try { if (recorderNode) recorderNode.disconnect(); } catch {}
+      recorderNode = null;
+
+      if (micStream) {
+        micStream.getTracks().forEach(t => t.stop());
+        micStream = null;
+      }
+
+      if (audioCtx) {
+        audioCtx.close();
+        audioCtx = null;
+      }
+
+      micBtn.classList.remove('active');
+    }
+
+    async function startRecording() {
+      await ensureAudio();
+      if (audioCtx.state === 'suspended') await audioCtx.resume();
+
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
+        }
+      });
+
+      const source = audioCtx.createMediaStreamSource(micStream);
+      source.connect(recorderNode); // into recorder worklet
+
+      isRecording = true;
+      micBtn.classList.add('active');
+      setStatus(`Listening...\n(AudioCtx: ${audioCtx.sampleRate} Hz)`, 'status-listening');
+
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'start' }));
+      }
+    }
+
+    function stopRecording() {
+      if (!isRecording) return;
+
+      // Ask recorder to flush any partial frame
+      try { recorderNode.port.postMessage('flush'); } catch {}
+
+      // Tell server to commit + respond
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        setTimeout(() => ws.send(JSON.stringify({ type: 'stop' })), 80);
+      }
+
+      if (micStream) {
+        micStream.getTracks().forEach(t => t.stop());
+        micStream = null;
+      }
+
+      isRecording = false;
+      micBtn.classList.remove('active');
+
+      if (!isAISpeaking) {
+        setStatus(`Connected - Click mic to talk\n(AudioCtx: ${audioCtx.sampleRate} Hz)`, 'status-connected');
+      }
+    }
+
+    // ---------- Combined worklet (player + recorder with resampling) ----------
+    function createCombinedWorkletURL() {
+      const code = `
+        const TARGET_RATE = ${TARGET_RATE};
+
+        function clamp1(x){ return x < -1 ? -1 : (x > 1 ? 1 : x); }
+
+        function floatToI16(x){
+          const s = clamp1(x);
+          return s < 0 ? (s * 0x8000) : (s * 0x7FFF);
+        }
+
+        // Linear resample Float32Array from inRate -> outRate
+        function resampleLinear(input, inRate, outRate){
+          if (inRate === outRate) return input;
+          const ratio = outRate / inRate;
+          const outLen = Math.max(1, Math.round(input.length * ratio));
+          const out = new Float32Array(outLen);
+          const scale = inRate / outRate;
+          for (let j = 0; j < outLen; j++){
+            const pos = j * scale;
+            const i0 = Math.floor(pos);
+            const i1 = Math.min(i0 + 1, input.length - 1);
+            const frac = pos - i0;
+            out[j] = (1 - frac) * input[i0] + frac * input[i1];
+          }
+          return out;
+        }
+
+        // -------- Player: receives PCM16 @ 24k, outputs at sampleRate (ctx rate) --------
+        class PCMPlayer extends AudioWorkletProcessor {
+          constructor(){
+            super();
+            this.ctxRate = sampleRate; // actual AudioContext rate (Edge often 48000)
+            this.ring = new Float32Array(this.ctxRate * 5); // 5s buffer
+            this.r = 0; this.w = 0; this.available = 0;
+
+            // jitter buffer: don't start output until we have ~250ms
+            this.started = false;
+            this.minBuffered = Math.floor(this.ctxRate * 0.25);
+
+            this.port.onmessage = (e) => {
+              const ab = e.data;
+              const i16 = new Int16Array(ab);
+              const f = new Float32Array(i16.length);
+              for (let i=0;i<i16.length;i++) f[i] = i16[i] / 32768;
+
+              // upsample 24k -> ctxRate if needed
+              const up = resampleLinear(f, TARGET_RATE, this.ctxRate);
+
+              for (let i=0;i<up.length;i++){
+                if (this.available >= this.ring.length){
+                  // drop oldest on overflow
+                  this.r = (this.r + 1) % this.ring.length;
+                  this.available--;
+                }
+                this.ring[this.w] = up[i];
+                this.w = (this.w + 1) % this.ring.length;
+                this.available++;
+              }
+            };
+          }
+
+          process(inputs, outputs){
+            const out = outputs[0][0];
+
+            if (!this.started){
+              if (this.available >= this.minBuffered) this.started = true;
+              else {
+                for (let i=0;i<out.length;i++) out[i] = 0;
+                return true;
+              }
+            }
+
+            for (let i=0;i<out.length;i++){
+              if (this.available > 0){
+                out[i] = this.ring[this.r];
+                this.r = (this.r + 1) % this.ring.length;
+                this.available--;
+              } else {
+                out[i] = 0; // underflow (should be rare now)
+              }
+            }
+            return true;
+          }
+        }
+
+        // -------- Recorder: takes mic at ctxRate, outputs PCM16 @ 24k in 20ms frames --------
+        class PCMRecorder extends AudioWorkletProcessor {
+          constructor(){
+            super();
+            this.ctxRate = sampleRate;
+            this.frameSize = 480; // 20ms @ 24k
+            this.frame = new Int16Array(this.frameSize);
+            this.framePos = 0;
+
+            // For non-48k rates we do linear resample on small chunks
+            this.tmp = [];
+
+            this.port.onmessage = (e) => {
+              if (e.data === 'flush'){
+                if (this.framePos > 0){
+                  for (let i=this.framePos;i<this.frameSize;i++) this.frame[i] = 0;
+                  this.port.postMessage(this.frame.buffer, [this.frame.buffer]);
+                  this.frame = new Int16Array(this.frameSize);
+                  this.framePos = 0;
+                }
+              }
+            };
+          }
+
+          pushSample(v){
+            this.frame[this.framePos++] = floatToI16(v);
+            if (this.framePos === this.frameSize){
+              this.port.postMessage(this.frame.buffer, [this.frame.buffer]);
+              this.frame = new Int16Array(this.frameSize);
+              this.framePos = 0;
+            }
+          }
+
+          process(inputs){
+            const input = inputs[0] && inputs[0][0];
+            if (!input) return true;
+
+            // Fast path: 48k -> 24k (average every 2 samples)
+            if (this.ctxRate === 48000){
+              for (let i=0;i<input.length;i+=2){
+                const a = input[i];
+                const b = input[i+1] ?? a;
+                this.pushSample(0.5*(a+b));
+              }
+              return true;
+            }
+
+            // Fast path: already 24k
+            if (this.ctxRate === 24000){
+              for (let i=0;i<input.length;i++){
+                this.pushSample(input[i]);
+              }
+              return true;
+            }
+
+            // Generic: linear resample this block to 24k
+            const down = resampleLinear(input, this.ctxRate, TARGET_RATE);
+            for (let i=0;i<down.length;i++){
+              this.pushSample(down[i]);
+            }
+            return true;
+          }
+        }
+
+        registerProcessor('pcm-player', PCMPlayer);
+        registerProcessor('pcm-recorder', PCMRecorder);
+      `;
+      return URL.createObjectURL(new Blob([code], { type: 'application/javascript' }));
+    }
+
+    // ---------- UI ----------
+    micBtn.addEventListener('click', async () => {
+      await ensureAudio();
+      if (audioCtx.state === 'suspended') await audioCtx.resume();
+
+      if (isRecording) stopRecording();
+      else await startRecording();
+    });
+
+    connect();
+  </script>
+</body>
+</html>
